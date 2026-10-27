@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# Trạng thái task và kiểm tra git cho quy trình agent-workflow.
+#
+#   agent-task status [--hook]      tóm tắt đang làm gì / tới đâu / làm tiếp thế nào
+#   agent-task archive              lưu TASK.md đã done vào docs/tasks/, xoá mốc
+#   agent-task sync-check pull|push kiểm tra xung đột TRƯỚC khi pull / push
+#   agent-task guard                hook PreToolUse của Claude: chặn git pull/push nếu sync-check không đạt
+#
+# Mã thoát: 0 = ổn, 1 = có vấn đề phải xử lý trước, 2 = lỗi dùng lệnh / môi trường.
+set -euo pipefail
+
+die() { echo "agent-task: $*" >&2; exit 2; }
+
+root() { git rev-parse --show-toplevel 2>/dev/null; }
+
+# Đọc một trường trong khối trạng thái / phần ĐIỀU PHỐI của TASK.md: "- <Tên>: <giá trị>   <!-- … -->"
+field() {
+  sed -n "s/^- $1:[[:space:]]*\(.*\)$/\1/p" "$2" 2>/dev/null | head -1 |
+    sed 's/<!--.*//; s/[[:space:]]*$//; s/^`\(.*\)`$/\1/'
+}
+
+# In các dòng (không phải comment) của một mục "### <tên>" trong TASK.md.
+section() {
+  awk -v h="### $1" '
+    $0 == h { on = 1; next }
+    on && (/^#/ || /^---/) { exit }
+    on && /<!--/ { c = 1 } on && !c && NF { print } on && /-->/ { c = 0 }
+  ' "$2" 2>/dev/null
+}
+
+cmd_status() {
+  local hook=0; [ "${1:-}" = --hook ] && hook=1
+  local R; R="$(root)" || { [ "$hook" = 1 ] && exit 0; die "không nằm trong git repo"; }
+  if [ "$hook" = 1 ]; then
+    grep -q 'agent-workflow:start' "$R/AGENTS.md" 2>/dev/null || exit 0
+    echo "[agent-workflow] Project này dùng quy trình trong AGENTS.md (khối agent-workflow). Đọc AGENTS.md, rồi TASK.md, trước khi làm. Trạng thái hiện tại:"
+  fi
+  local T="$R/TASK.md" BR HEAD
+  BR="$(git -C "$R" symbolic-ref --short -q HEAD || echo "(detached)")"
+  HEAD="$(git -C "$R" rev-parse --short HEAD 2>/dev/null || echo "-")"
+  echo "== Project: $R — nhánh $BR @ $HEAD"
+
+  if [ ! -f "$T" ]; then
+    echo "Task: không có TASK.md — chưa có task nào mở."
+  else
+    local ID ST
+    ID="$(field 'Task ID' "$T")"; ST="$(field 'Trạng thái' "$T")"
+    echo "Task: ${ID:-?} — $(sed -n 's/^# TASK — //p' "$T" | head -1)"
+    echo "  Trạng thái: ${ST:-?} | Bước tiếp theo: $(field 'Bước tiếp theo' "$T")"
+    echo "  Đang làm bởi: $(field 'Đang làm bởi' "$T" | sed 's/^$/(không ai)/')"
+    echo "  Chặn / cần user quyết: $(field 'Chặn \/ cần user quyết' "$T")"
+    local GD; GD="$(field 'Giai đoạn' "$T")"
+    if [ -n "$GD" ]; then
+      echo "  Điều phối: giai đoạn $GD | vòng review $(field 'Vòng review' "$T") | đang chờ user: $(field 'Đang chờ user' "$T")"
+      echo "  Yêu cầu gốc: $(field 'Yêu cầu gốc của user' "$T")"
+    fi
+    local Q; Q="$(section 'Quyết định của user' "$T")"
+    [ -z "$Q" ] || { echo "  Quyết định của user:"; echo "$Q" | sed 's/^/    /'; }
+    local L; L="$(section 'Nhật ký điều phối' "$T" | tail -3)"
+    [ -z "$L" ] || { echo "  Nhật ký điều phối (3 dòng cuối):"; echo "$L" | sed 's/^/    /'; }
+    if [ -n "$ID" ]; then
+      if git -C "$R" rev-parse -q --verify "refs/agent-base/$ID" >/dev/null; then
+        echo "  Mốc: refs/agent-base/$ID có — xem thay đổi: git diff --stat refs/agent-base/$ID -- . ':!TASK.md'"
+      elif [ "$ST" != done ] && [ "$ST" != planned ]; then
+        echo "  Mốc: thiếu refs/agent-base/$ID (máy/clone khác?) — agent-run sẽ dựng lại từ hash trong mục Mốc hoặc HEAD lúc lập plan."
+      fi
+    fi
+  fi
+
+  local LOCK="$R/.agent-workflow/write.lock"
+  if [ -d "$LOCK" ]; then
+    local PID; PID="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+      echo "Đang chạy: $(cat "$LOCK/owner" 2>/dev/null) (pid $PID)"
+    else
+      echo "Khoá kẹt: $(cat "$LOCK/owner" 2>/dev/null) — tiến trình đã chết, agent-run sẽ tự gỡ."
+    fi
+  fi
+
+  local DIRTY; DIRTY="$(git -C "$R" status --porcelain | wc -l | tr -d ' ')"
+  local UP; UP="$(git -C "$R" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  if [ -n "$UP" ]; then
+    read -r A B < <(git -C "$R" rev-list --left-right --count "HEAD...$UP")
+    echo "Git: $DIRTY file chưa commit | so với $UP (lần fetch gần nhất): đi trước $A, đi sau $B"
+  else
+    echo "Git: $DIRTY file chưa commit | chưa có upstream"
+  fi
+
+  if [ -d "$R/docs/tasks" ]; then
+    echo "Task đã xong gần đây (docs/tasks/INDEX.md):"
+    tail -3 "$R/docs/tasks/INDEX.md" 2>/dev/null | sed 's/^/  /'
+  fi
+  [ "$hook" = 1 ] || echo "Đọc tiếp: TASK.md (toàn bộ) trước khi làm."
+}
+
+cmd_archive() {
+  local R; R="$(root)" || die "không nằm trong git repo"
+  local T="$R/TASK.md"; [ -f "$T" ] || die "không có TASK.md"
+  local ID ST; ID="$(field 'Task ID' "$T")"; ST="$(field 'Trạng thái' "$T")"
+  [ -n "$ID" ] || die "TASK.md chưa có Task ID"
+  [ "$ST" = done ] || die "task $ID chưa done (đang: $ST) — không lưu"
+  mkdir -p "$R/docs/tasks"
+  local DEST="$R/docs/tasks/$ID.md"
+  cp "$T" "$DEST"
+  local IDX="$R/docs/tasks/INDEX.md"
+  [ -f "$IDX" ] || printf '# Các task đã xong\n\n' > "$IDX"
+  grep -qF "\`$ID\`" "$IDX" || printf -- '- `%s` — %s — xong %s — [%s.md](%s.md)\n' \
+    "$ID" "$(sed -n 's/^# TASK — //p' "$T" | head -1)" "$(date '+%Y-%m-%d')" "$ID" "$ID" >> "$IDX"
+  git -C "$R" update-ref -d "refs/agent-base/$ID" 2>/dev/null || true
+  echo "Đã lưu docs/tasks/$ID.md, cập nhật docs/tasks/INDEX.md, xoá refs/agent-base/$ID."
+}
+
+# ---------- sync-check ----------
+cmd_sync_check() {
+  local MODE="${1:-}"; case "$MODE" in pull|push) ;; *) die "dùng: agent-task sync-check pull|push" ;; esac
+  local R; R="$(root)" || die "không nằm trong git repo"
+  cd "$R"
+  local PROBLEMS=() WARN=() GD
+  GD="$(git rev-parse --git-dir)"
+
+  # Thao tác dở dang
+  [ -f "$GD/MERGE_HEAD" ] && PROBLEMS+=("Đang merge dở (MERGE_HEAD). Hoàn tất hoặc 'git merge --abort' trước.")
+  [ -d "$GD/rebase-merge" ] || [ -d "$GD/rebase-apply" ] && PROBLEMS+=("Đang rebase dở. Hoàn tất hoặc 'git rebase --abort' trước.")
+  [ -f "$GD/CHERRY_PICK_HEAD" ] && PROBLEMS+=("Đang cherry-pick dở.")
+  local UNMERGED; UNMERGED="$(git diff --name-only --diff-filter=U)"
+  [ -z "$UNMERGED" ] || PROBLEMS+=("Còn file đang xung đột chưa giải quyết: $(echo $UNMERGED)")
+
+  local BR; BR="$(git symbolic-ref --short -q HEAD)" || PROBLEMS+=("HEAD đang detached — không pull/push được an toàn.")
+
+  # Lấy trạng thái mới nhất của remote
+  local FERR
+  if [ -n "$(git remote)" ] && ! FERR="$(git fetch --prune --quiet 2>&1)"; then
+    PROBLEMS+=("git fetch lỗi: $(printf '%s' "$FERR" | head -2 | tr '\n' ' ') — không kiểm tra được remote.")
+  fi
+
+  local UP=""
+  UP="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  if [ -z "$UP" ] && [ -n "${BR:-}" ]; then
+    local RM; RM="$(git config "branch.$BR.remote" || git remote | head -1)"
+    [ -n "$RM" ] && git rev-parse -q --verify "refs/remotes/$RM/$BR" >/dev/null && UP="$RM/$BR"
+  fi
+
+  local AHEAD=0 BEHIND=0
+  if [ -n "$UP" ]; then
+    read -r AHEAD BEHIND < <(git rev-list --left-right --count "HEAD...$UP")
+  fi
+
+  # File chưa commit (kể cả chưa track)
+  local DIRTY; DIRTY="$(git status --porcelain --untracked-files=all | sed 's/^...//; s/.* -> //')"
+
+  echo "== sync-check $MODE — nhánh ${BR:-?} — upstream ${UP:-(chưa có)}"
+  echo "   đi trước $AHEAD commit, đi sau $BEHIND commit; $(printf '%s' "$DIRTY" | grep -c . || true) file chưa commit"
+
+  if [ -n "$UP" ] && [ "$BEHIND" -gt 0 ]; then
+    local INCOMING; INCOMING="$(git diff --name-only "HEAD...$UP")"
+    echo "   Commit mới trên remote:"
+    git log --oneline --no-decorate -10 "HEAD..$UP" | sed 's/^/     /'
+
+    # 1) File chưa commit trùng với file remote đã đổi → git pull sẽ từ chối hoặc gây xung đột
+    local OVERLAP; OVERLAP="$(comm -12 <(printf '%s\n' "$DIRTY" | sort -u) <(printf '%s\n' "$INCOMING" | sort -u) | grep . || true)"
+    [ -z "$OVERLAP" ] || PROBLEMS+=("File chưa commit trùng với file remote đã sửa (pull sẽ bị chặn hoặc xung đột): $(echo $OVERLAP). Commit hoặc stash trước.")
+
+    # 2) Cả hai bên đều có commit mới → giả lập merge
+    if [ "$AHEAD" -gt 0 ]; then
+      local MT CODE
+      set +e; MT="$(git merge-tree --write-tree --name-only --no-messages HEAD "$UP" 2>&1)"; CODE=$?; set -e
+      if [ "$CODE" = 1 ]; then
+        PROBLEMS+=("Merge HEAD với $UP sẽ XUNG ĐỘT ở: $(echo "$MT" | tail -n +2 | tr '\n' ' ')")
+      elif [ "$CODE" != 0 ]; then
+        PROBLEMS+=("Không giả lập được merge: $MT")
+      else
+        WARN+=("Hai bên đều có commit mới nhưng merge sạch (giả lập bằng merge-tree). Nếu dùng pull --rebase, xung đột theo từng commit vẫn có thể khác.")
+      fi
+    fi
+
+    # 3) Trạng thái task bị đổi từ nơi khác
+    if printf '%s\n' "$INCOMING" | grep -qx 'TASK.md'; then
+      WARN+=("TASK.md trên remote đã đổi — có agent/máy khác cập nhật task. Sau khi pull, chạy 'agent-task status' và đọc lại TASK.md trước khi làm tiếp.")
+    fi
+  fi
+
+  if [ "$MODE" = push ]; then
+    if [ -z "$UP" ]; then
+      WARN+=("Chưa có nhánh trên remote — push sẽ tạo nhánh mới (dùng 'git push -u <remote> ${BR:-<nhánh>}').")
+      AHEAD="$(git rev-list --count HEAD --not --remotes)"
+    elif [ "$BEHIND" -gt 0 ]; then
+      PROBLEMS+=("Remote có $BEHIND commit mà local chưa có — push sẽ bị từ chối (hoặc ghi đè nếu --force). Chạy 'agent-task sync-check pull' rồi pull trước.")
+    fi
+    if [ "$AHEAD" = 0 ]; then
+      WARN+=("Không có commit nào để push.")
+    else
+      echo "   Sẽ push:"
+      if [ -n "$UP" ]; then git log --oneline --no-decorate -10 "$UP..HEAD"; else git log --oneline --no-decorate -10 HEAD --not --remotes; fi | sed 's/^/     /'
+    fi
+    [ -z "$DIRTY" ] || WARN+=("Có file chưa commit — sẽ KHÔNG được push: $(echo $DIRTY | cut -c1-300)")
+  else
+    [ "$BEHIND" = 0 ] && [ -n "$UP" ] && WARN+=("Local đã có mọi commit của remote — không có gì để pull.")
+  fi
+
+  local w p
+  for w in "${WARN[@]+"${WARN[@]}"}"; do echo "   ⚠️  $w"; done
+  if [ "${#PROBLEMS[@]}" -gt 0 ]; then
+    for p in "${PROBLEMS[@]}"; do echo "   ❌ $p"; done
+    echo "== KẾT LUẬN: CHƯA ĐƯỢC $MODE — xử lý các mục ❌ trước."
+    return 1
+  fi
+  echo "== KẾT LUẬN: OK để $MODE."
+}
+
+# ---------- guard (hook PreToolUse cho Bash của Claude Code) ----------
+cmd_guard() {
+  local IN CMD CWD MODE
+  IN="$(cat)"
+  CMD="$(jq -r '.tool_input.command // empty' <<<"$IN")"
+  CWD="$(jq -r '.cwd // empty' <<<"$IN")"
+  [ -n "$CMD" ] || exit 0
+  [ "${AGENT_SYNC_OK:-}" = 1 ] && exit 0
+  case "$CMD" in *AGENT_SYNC_OK=1*) exit 0 ;; esac
+  # git [-C dir] [-c k=v] push|pull ở đầu lệnh hoặc sau ; && || |
+  MODE="$(printf '%s' "$CMD" | grep -oE '(^|[;&|(]|[[:space:]])git([[:space:]]+-[Cc][[:space:]]+[^[:space:]]+)*[[:space:]]+(push|pull)([[:space:]]|$)' | grep -oE '(push|pull)' | head -1 || true)"
+  [ -n "$MODE" ] || exit 0
+  local DIR; DIR="$(printf '%s' "$CMD" | sed -nE 's/.*git[[:space:]]+-C[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)"
+  DIR="${DIR/#\~/$HOME}"
+  [ -n "$DIR" ] || DIR="$CWD"
+  [ -n "$DIR" ] && cd "$DIR" 2>/dev/null || true
+  root >/dev/null || exit 0
+  local OUT
+  if OUT="$(cmd_sync_check "$MODE" 2>&1)"; then
+    exit 0
+  fi
+  {
+    echo "agent-workflow đã chặn 'git $MODE' vì kiểm tra trước thấy vấn đề:"
+    echo "$OUT"
+    echo "Xử lý các mục ❌ (hoặc báo user). Chỉ khi user nói rõ vẫn làm, mới chạy lại với tiền tố AGENT_SYNC_OK=1."
+  } >&2
+  exit 2
+}
+
+case "${1:-}" in
+  status) shift; cmd_status "$@" ;;
+  archive) shift; cmd_archive "$@" ;;
+  sync-check) shift; cmd_sync_check "$@" ;;
+  guard) shift; cmd_guard "$@" ;;
+  *) sed -n '2,9p' "$0"; exit 2 ;;
+esac

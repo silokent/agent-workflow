@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Giao việc cho một vai (Codex) và in câu trả lời cuối cho Orchestrator.
+#
+#   agent-run <vai> [tuỳ chọn] "<lời giao việc>"      (hoặc "-" để đọc từ stdin)
+#
+#   vai:  planner | executor | researcher | reviewer | artist (tạo ảnh)
+#   --hard           executor dùng model cho việc khó (dòng executor-hard)
+#   --resume         tiếp tục phiên Codex gần nhất của vai này trong project
+#   --resume-id ID   tiếp tục một phiên Codex cụ thể
+#   --cd DIR         chạy trong project DIR (mặc định: thư mục hiện tại)
+#   --save SLUG      researcher: tên file báo cáo ở docs/research/<ngày>-SLUG.md
+#   --dry-run        chỉ in lệnh codex sẽ chạy
+#
+# Mỗi lần chạy lưu ở <project>/.agent-workflow/runs/<thời-gian>-<vai>/:
+#   prompt.md, events.jsonl, stderr.log, last.md (câu trả lời cuối), meta
+# Stdout chỉ in phần tóm tắt + last.md để Orchestrator đỡ tốn context.
+# Trạng thái lâu dài KHÔNG nằm trong phiên Codex mà trong file được commit:
+#   TASK.md (agent-run tự thêm một dòng vào "Nhật ký điều phối" sau mỗi lượt),
+#   docs/research/ (báo cáo của researcher), docs/tasks/ (task đã xong).
+set -euo pipefail
+
+KIT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+die() { echo "agent-run: $*" >&2; exit 2; }
+
+[ $# -ge 1 ] || die "thiếu vai. Xem đầu file $0"
+ROLE="$1"; shift
+case "$ROLE" in planner|executor|researcher|reviewer|artist) ;; *) die "vai không hợp lệ: $ROLE" ;; esac
+
+HARD=0 RESUME="" DIR="." DRY=0 BRIEF="" SAVE="research"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --hard) HARD=1 ;;
+    --resume) RESUME="last" ;;
+    --resume-id) RESUME="${2:?thiếu ID}"; shift ;;
+    --cd) DIR="${2:?thiếu DIR}"; shift ;;
+    --dry-run) DRY=1 ;;
+    --save) SAVE="${2:?thiếu SLUG}"; shift ;;
+    -) BRIEF="$(cat)" ;;
+    --) shift; BRIEF="$*"; break ;;
+    -*) die "tuỳ chọn lạ: $1" ;;
+    *) BRIEF="$1" ;;
+  esac
+  shift
+done
+[ -n "$BRIEF" ] || die "thiếu lời giao việc"
+[ "$HARD" = 0 ] || [ "$ROLE" = executor ] || die "--hard chỉ dùng cho executor"
+
+ROOT="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null)" || die "$DIR không nằm trong git repo"
+STATE="$ROOT/.agent-workflow"
+mkdir -p "$STATE/runs" "$STATE/threads"
+
+# --- Tra model: kit trước, project ghi đè sau ---
+KEY="$ROLE"; [ "$HARD" = 1 ] && KEY="executor-hard"
+read -r MODEL EFFORT SANDBOX FLAGS < <(
+  cat "$KIT/roles.conf" "$STATE/roles.conf" 2>/dev/null |
+    awk -v k="$KEY" '!/^[[:space:]]*#/ && $1 == k { m=$2; e=$3; s=$4; f=$5 } END { print m, e, s, (f == "" ? "-" : f) }'
+)
+[ -n "$MODEL" ] || die "không thấy vai '$KEY' trong roles.conf"
+MODEL="${AGENT_MODEL:-$MODEL}"; EFFORT="${AGENT_EFFORT:-$EFFORT}"
+
+ARGS=(-m "$MODEL" -c "model_reasoning_effort=\"$EFFORT\"" -c "sandbox_mode=\"$SANDBOX\"" --json)
+case ",$FLAGS," in *,net,*) ARGS+=(-c "sandbox_workspace_write.network_access=true") ;; esac
+case ",$FLAGS," in *,search,*) ARGS+=(-c 'web_search="live"') ;; esac
+
+T="$ROOT/TASK.md"
+TID="" TSTATUS=""
+if [ -f "$T" ]; then
+  TID="$(sed -n 's/^- Task ID: `\([^`<]*\)`.*/\1/p' "$T" | head -1)"
+  TSTATUS="$(sed -n 's/^- Trạng thái:[[:space:]]*\([a-z-]*\).*/\1/p' "$T" | head -1)"
+fi
+
+if [ "$RESUME" = last ]; then
+  # Không có phiên cũ (máy khác, đã xoá .agent-workflow…) thì mở phiên mới:
+  # mọi thứ cần để làm tiếp đã nằm trong TASK.md.
+  RESUME="$(cat "$STATE/threads/$KEY" 2>/dev/null || true)"
+  [ -n "$RESUME" ] || echo "agent-run: không có phiên cũ của $KEY — mở phiên mới, Codex sẽ đọc TASK.md để làm tiếp." >&2
+fi
+
+RUN="$STATE/runs/$(date +%Y%m%d-%H%M%S)-$KEY"
+mkdir -p "$RUN"
+if [ -n "$RESUME" ]; then
+  CMD=(codex exec resume "${ARGS[@]}" -o "$RUN/last.md" "$RESUME" -)
+else
+  CMD=(codex exec "${ARGS[@]}" -C "$ROOT" -o "$RUN/last.md" -)
+fi
+if [ "$DRY" = 1 ]; then
+  printf '%q ' "${CMD[@]}"; echo; rm -rf "$RUN"; exit 0
+fi
+
+# --- Khoá: mỗi lúc chỉ một vai được ghi vào repo; khoá của tiến trình đã chết thì tự gỡ ---
+LOCK="$STATE/write.lock"
+if [ "$SANDBOX" != read-only ]; then
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    OLDPID="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+      die "đang có vai khác ghi vào repo: $(cat "$LOCK/owner" 2>/dev/null) (pid $OLDPID)"
+    fi
+    echo "agent-run: gỡ khoá kẹt của $(cat "$LOCK/owner" 2>/dev/null || echo '?')" >&2
+    rm -rf "$LOCK"; mkdir "$LOCK"
+  fi
+  echo "$KEY — $RUN" > "$LOCK/owner"; echo $$ > "$LOCK/pid"
+  trap 'rm -rf "$LOCK"' EXIT
+fi
+
+NOTE=""
+# --- Task cũ đã done mà chưa lưu: lưu vào docs/tasks/ trước khi Planner thay TASK.md ---
+if [ "$ROLE" = planner ] && [ "$TSTATUS" = done ] && [ -n "$TID" ] && [ ! -f "$ROOT/docs/tasks/$TID.md" ]; then
+  (cd "$ROOT" && "$KIT/bin/agent-task" archive) >&2
+fi
+
+# --- Mốc so sánh: sandbox Codex không ghi được .git, nên agent-run lo phần này ---
+has_commit() { [ -n "$1" ] && git -C "$ROOT" cat-file -e "$1^{commit}" 2>/dev/null; }
+if { [ "$ROLE" = executor ] || [ "$ROLE" = reviewer ]; } && [ -n "$TID" ] && [ "$TSTATUS" != done ]; then
+  REF="refs/agent-base/$TID"
+  MARK="$(sed -n 's/^- `refs\/agent-base\/[^`]*` = `\([0-9a-f]\{7,40\}\)`.*/\1/p' "$T" | head -1)"
+  PLANHEAD="$(sed -n 's/.*HEAD `\([0-9a-f]\{7,40\}\)`.*/\1/p' "$T" | head -1)"
+  if BASE="$(git -C "$ROOT" rev-parse -q --verify "$REF")"; then
+    NOTE="Mốc \`$REF\` đã có (\`${BASE:0:10}\`), không tạo lại."
+  elif has_commit "$MARK"; then
+    git -C "$ROOT" update-ref "$REF" "$(git -C "$ROOT" rev-parse "$MARK^{commit}")"
+    NOTE="agent-run đã dựng lại mốc \`$REF\` từ hash \`$MARK\` ghi trong mục \"Mốc\"."
+  elif [ -n "$MARK" ] || [ "$ROLE" = reviewer ]; then
+    if has_commit "$PLANHEAD"; then
+      git -C "$ROOT" update-ref "$REF" "$(git -C "$ROOT" rev-parse "$PLANHEAD^{commit}")"
+      NOTE="Mốc gốc ${MARK:+\`$MARK\` }không có trong clone này (tạo ở máy/clone khác). agent-run dùng HEAD lúc lập plan \`$PLANHEAD\` làm mốc thay thế: diff có thể gồm cả thay đổi không thuộc task — đối chiếu với nhật ký. Không sửa mục \"Mốc\"; ghi một dòng vào nhật ký."
+    else
+      NOTE="Không dựng được mốc \`$REF\` ở clone này. Dùng danh sách \"File sửa\" trong nhật ký để biết phạm vi thay đổi, và ghi rõ điều đó."
+    fi
+  else
+    BASE="$(git -C "$ROOT" stash create)"; BASE="${BASE:-$(git -C "$ROOT" rev-parse HEAD)}"
+    git -C "$ROOT" update-ref "$REF" "$BASE"
+    NOTE="Mốc \`$REF\` = \`$BASE\` đã được agent-run tạo sẵn (sandbox không cho bạn ghi \`.git\`). Bỏ qua lệnh tạo mốc, chỉ ghi nó vào mục \"Mốc\"."
+  fi
+fi
+
+# --- Ghép prompt: luật vai + lời giao việc (phiên resume đã có luật vai, chỉ gửi lời giao việc) ---
+{
+  [ -n "$RESUME" ] || { cat "$KIT/roles/$ROLE.md"; printf '\n---\n\n## Lời giao việc từ Orchestrator\n\n'; }
+  printf '%s\n' "$BRIEF"
+  [ -z "$NOTE" ] || printf '\n%s\n' "$NOTE"
+} > "$RUN/prompt.md"
+
+START=$(date +%s)
+set +e
+(cd "$ROOT" && "${CMD[@]}" < "$RUN/prompt.md" > "$RUN/events.jsonl" 2> "$RUN/stderr.log")
+CODE=$?
+set -e
+SECS=$(( $(date +%s) - START ))
+
+THREAD="$(jq -r 'select(.type == "thread.started") | .thread_id' "$RUN/events.jsonl" 2>/dev/null | head -1 || true)"
+[ -n "$THREAD" ] || THREAD="$RESUME"
+[ -n "$THREAD" ] && echo "$THREAD" > "$STATE/threads/$KEY"
+USAGE="$(jq -c 'select(.type == "turn.completed") | .usage | {in: .input_tokens, cached: .cached_input_tokens, out: .output_tokens}' "$RUN/events.jsonl" 2>/dev/null | tail -1 || true)"
+
+cat > "$RUN/meta" <<EOF
+role=$KEY
+model=$MODEL
+effort=$EFFORT
+sandbox=$SANDBOX
+flags=$FLAGS
+thread=$THREAD
+exit=$CODE
+seconds=$SECS
+usage=$USAGE
+EOF
+
+# --- Lưu báo cáo research vào chỗ được commit, để agent/phiên khác đọc được ---
+REPORT=""
+if [ "$ROLE" = researcher ] && [ "$CODE" = 0 ] && [ -s "$RUN/last.md" ]; then
+  mkdir -p "$ROOT/docs/research"
+  REPORT="docs/research/$(date +%Y%m%d-%H%M)-$SAVE.md"
+  {
+    printf '# Research — %s\n\n' "$SAVE"
+    printf -- '- Ngày: %s — %s (%s / %s)\n' "$(date '+%Y-%m-%d %H:%M')" "$KEY" "$MODEL" "$EFFORT"
+    printf -- '- Câu hỏi:\n\n%s\n\n---\n\n' "$(printf '%s\n' "$BRIEF" | sed 's/^/    /')"
+    cat "$RUN/last.md"
+  } > "$ROOT/$REPORT"
+fi
+
+# --- Một dòng vào "Nhật ký điều phối" của TASK.md (nếu task đang mở) ---
+RESULT="$(grep -m1 '^KẾT QUẢ:' "$RUN/last.md" 2>/dev/null | sed 's/^KẾT QUẢ:[[:space:]]*//; s/[[:space:]]*$//' || true)"
+[ -n "$RESULT" ] || RESULT="${REPORT:+báo cáo $REPORT}"
+[ -n "$RESULT" ] || RESULT="exit $CODE, không có dòng KẾT QUẢ"
+LINE="- $(date '+%Y-%m-%d %H:%M') — $KEY ($MODEL/$EFFORT) — $RESULT — ${SECS}s — log: .agent-workflow/runs/$(basename "$RUN")"
+[ -f "$T" ] && python3 "$KIT/bin/journal.py" "$T" "$LINE" || true
+
+echo "== agent-run: $KEY ($MODEL / $EFFORT) — exit $CODE — ${SECS}s"
+echo "== thread: ${THREAD:-?}   log: $RUN"
+[ -n "$USAGE" ] && echo "== tokens: $USAGE"
+[ -n "$REPORT" ] && echo "== báo cáo đã lưu: $REPORT"
+echo
+if [ -s "$RUN/last.md" ]; then
+  cat "$RUN/last.md"
+else
+  echo "(Codex không để lại câu trả lời cuối. 20 dòng cuối của stderr:)"
+  tail -20 "$RUN/stderr.log"
+fi
+exit "$CODE"
