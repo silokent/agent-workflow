@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Cài hoặc cập nhật quy trình Orchestrator → Plan → Execute → Review vào một project.
 #   ~/agent-workflow/install.sh [đường-dẫn-project]   (mặc định: thư mục hiện tại)
+#   ~/agent-workflow/install.sh --global              (chỉ cài phần dùng chung cho máy: lệnh, skill, hook)
 # Chạy lại bất cứ lúc nào: chỉ thay khối workflow trong AGENTS.md và file mẫu,
 # không đụng phần mô tả riêng của project hay TASK.md đang có.
 # Luật dùng chung nằm trong AGENTS.md (Codex đọc sẵn; Claude đọc qua skill orchestrate),
@@ -8,7 +9,8 @@
 set -euo pipefail
 
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT="$(cd "${1:-.}" && pwd)"
+GLOBAL_ONLY=0
+if [ "${1:-}" = --global ]; then GLOBAL_ONLY=1; else PROJECT="$(cd "${1:-.}" && pwd)"; fi
 
 # --- Phần dùng chung cho mọi project (idempotent) ---
 mkdir -p "$HOME/.local/bin" "$HOME/.claude/skills"
@@ -43,6 +45,11 @@ if [ "$NEW" != "$(jq . "$SETTINGS")" ]; then
 fi
 command -v agent-run >/dev/null || echo "Lưu ý: ~/.local/bin chưa nằm trong PATH, agent-run sẽ không gọi được."
 command -v codex >/dev/null || echo "Lưu ý: chưa cài Codex CLI (codex)."
+
+if [ "$GLOBAL_ONLY" = 1 ]; then
+  echo "Xong phần dùng chung. Cài vào project: $KIT/install.sh /đường/dẫn/project"
+  exit 0
+fi
 
 # --- Phần riêng của project ---
 mkdir -p "$PROJECT/docs"

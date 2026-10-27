@@ -42,7 +42,8 @@ Hook PreToolUse `agent-task guard` chặn `git pull` / `git push` của Claude k
 - `templates/`: `TASK.md`, `AGENTS.project.md`.
 
 ## Cài vào project
-    ~/agent-workflow/install.sh /đường/dẫn/project
+    ~/agent-workflow/install.sh --global              # chỉ phần dùng chung cho máy (lệnh, skill, hook)
+    ~/agent-workflow/install.sh /đường/dẫn/project    # cài vào project (kèm luôn phần dùng chung)
 Lần đầu chạy, lệnh này:
 - link `agent-run` và `agent-task` vào `~/.local/bin`;
 - link 3 skill vào `~/.claude/skills`. Skill cũ dạng thư mục thật được chuyển vào `.backup/`;

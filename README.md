@@ -100,7 +100,8 @@ A Claude Code **PreToolUse hook** (`agent-task guard`) runs the check automatica
 
 ```bash
 git clone https://github.com/silokent/agent-workflow.git ~/agent-workflow
-~/agent-workflow/install.sh /path/to/your/project
+~/agent-workflow/install.sh --global              # machine-wide parts only (commands, skills, hooks)
+~/agent-workflow/install.sh /path/to/your/project # wire a project (also does the machine-wide parts)
 ```
 
 `install.sh` does this:
